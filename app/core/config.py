@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     DB_ECHO: bool = False
 
     # --- CORS ---
-    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173" , "https://apimarket-ui.onrender.com"]
 
     # --- Algorand network ---
     ALGOD_ADDRESS: str = "https://testnet-api.algonode.cloud"
