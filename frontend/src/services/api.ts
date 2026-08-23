@@ -11,6 +11,18 @@ import type {
   UserRole,
 } from "../types";
 
+// --- API base URL ---------------------------------------------------------
+// In dev, Vite's proxy (see vite.config.ts) forwards /api, /market, /health
+// to localhost:8000, so a relative path works fine there.
+// In production the frontend is usually deployed on a different origin than
+// the backend (e.g. this app on Vercel/Netlify, backend on Render), so
+// relative paths would hit the wrong host. VITE_API_BASE_URL lets the build
+// point at the real backend; it defaults to the deployed Render backend so
+// the app works out of the box even without a .env file.
+const API_BASE_URL: string =
+  (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ||
+  "https://apimarket-mp7s.onrender.com";
+
 class ApiError extends Error {
   status: number;
   body: unknown;
@@ -52,7 +64,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   };
   if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
 
-  const res = await fetch(path, { ...options, headers });
+  // In dev, keep hitting relative paths so Vite's proxy handles them.
+  // In a production build, prefix with the real backend origin.
+  const url = import.meta.env.DEV ? path : `${API_BASE_URL}${path}`;
+
+  const res = await fetch(url, { ...options, headers });
 
   // Central 401 handling: session expired or invalid -> log out.
   if (res.status === 401) {
