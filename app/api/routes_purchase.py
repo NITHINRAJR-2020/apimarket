@@ -30,7 +30,7 @@ async def call_listing(listing_path: str, request: Request) -> Response:
       1. No X-402-Payment-Proof header -> 402 with a signed quote whose
          payTo is the platform's escrow wallet.
       2. Agent pays that quote on Algorand, then retries with
-         X-402-Payment-Proof: {"tx_id": "...", "quote": "..."} -> funds
+         X-402-Payment-Proof:{"payment_payload": {...}, "quote": ...} -> funds
          are verified into escrow, the upstream API is called on the
          agent's behalf, and escrow is released/refunded automatically
          based on whether that call actually succeeded.
