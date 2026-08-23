@@ -1,0 +1,24 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: apimarket
+      POSTGRES_PASSWORD: apimarket
+      POSTGRES_DB: apimarket
+    ports:
+      - "5432:5432"
+    volumes:
+      - apimarket_pg_data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://apimarket:apimarket@db:5432/apimarket
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+volumes:
+  apimarket_pg_data:
