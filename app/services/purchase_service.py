@@ -221,7 +221,7 @@ async def start_or_settle_purchase(
         body, headers = build_402_body(listing)
         return agent, listing, None, body, headers
 
-       payment_payload = payment_proof.get("payment_payload")
+    payment_payload = payment_proof.get("payment_payload")
     quote_token = payment_proof.get("quote")
     if not payment_payload or not quote_token:
         raise PurchaseError(400, "Payment proof must include 'payment_payload' and 'quote'")
@@ -252,16 +252,6 @@ async def start_or_settle_purchase(
     if replay.scalar_one_or_none() is not None:
         raise PurchaseError(409, f"Transaction {verified.tx_id} has already been used for a purchase (replay)")
 
-    try:
-        verified = await verify_payment(
-            tx_id=tx_id,
-            expected_recipient=settings.ESCROW_WALLET_ADDRESS,
-            expected_amount=listing.price_microalgos,
-            expected_asa_id=listing.asa_id,
-        )
-    except PaymentVerificationError as exc:
-        raise PurchaseError(402, f"Escrow payment verification failed: {exc}") from exc
-
     txn = Transaction(
         agent_id=agent.id,
         listing_id=listing.id,
@@ -279,7 +269,7 @@ async def start_or_settle_purchase(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        raise PurchaseError(409, f"Transaction {tx_id} has already been used for a purchase (replay)") from exc
+        raise PurchaseError(409, f"Transaction {verified.tx_id} has already been used for a purchase (replay)") from exc
     await db.refresh(txn)
 
     fee = escrow_wallet.compute_platform_fee_microalgos(txn.amount_microalgos)
