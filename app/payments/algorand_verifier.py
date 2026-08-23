@@ -172,81 +172,140 @@ async def verify_payment_on_chain(
     )
 
 
-async def verify_payment_with_x402_avm(
-    *,
-    tx_id: str,
-    expected_recipient: str,
-    expected_amount: int,
-    expected_asa_id: int | None,
-) -> VerifiedPayment | None:
-    """Best-effort fast path using the x402-avm SDK's facilitator/verify
-    helpers, if the package is installed. Falls back silently (returns
-    None) if the package is absent or its verification call fails, so the
-    caller can retry against algod/indexer directly.
+# ---------------------------------------------------------------------------
+# GoPlausible x402 v2 facilitator integration (verify + settle)
+# ---------------------------------------------------------------------------
+# Real SDK types/client -- confirmed against the installed x402-avm==2.0.2
+# package (x402.http.HTTPFacilitatorClient / x402.schemas), not guessed.
 
-    NOTE: the x402-avm package is an emerging, actively-evolving SDK for
-    the x402 Global Challenge. Its exact API surface may change between
-    versions, so this integration is written defensively: any import or
-    call failure is caught and logged, and control returns to the caller
-    to fall back on the direct algod/indexer verification path above,
-    which is protocol-stable and does not depend on this package.
+from x402.http import FacilitatorConfig, HTTPFacilitatorClient  # noqa: E402
+from x402.schemas import PaymentPayload, PaymentRequirements  # noqa: E402
+
+_facilitator_client: HTTPFacilitatorClient | None = None
+
+
+def get_facilitator_client() -> HTTPFacilitatorClient:
+    global _facilitator_client
+    if _facilitator_client is None:
+        _facilitator_client = HTTPFacilitatorClient(FacilitatorConfig(url=settings.FACILITATOR_URL))
+    return _facilitator_client
+
+
+def build_payment_requirements(
+    *, expected_recipient: str, expected_amount: int, expected_asa_id: int | None
+) -> PaymentRequirements:
+    """Builds the x402 v2 PaymentRequirements GoPlausible will verify the
+    client's PaymentPayload against. asset is the ASA id as a string;
+    for native ALGO (no asa_id) we still need an asset identifier -- the
+    marketplace prices exclusively in the configured USDC ASA today, so
+    expected_asa_id should always be set in practice.
     """
-    try:
-        from x402_avm import facilitator as x402_facilitator  # type: ignore
-    except ImportError:
-        logger.info("x402-avm not installed; using direct algod/indexer verification only")
-        return None
-
-    def _verify() -> VerifiedPayment | None:
-        try:
-            result = x402_facilitator.verify(
-                tx_id=tx_id,
-                network=settings.ALGORAND_NETWORK,
-                pay_to=expected_recipient,
-                amount=expected_amount,
-                asset_id=expected_asa_id,
-            )
-            if not result or not getattr(result, "is_valid", False):
-                return None
-            return VerifiedPayment(
-                tx_id=tx_id,
-                payer_address=result.payer,
-                receiver_address=expected_recipient,
-                amount=expected_amount,
-                asa_id=expected_asa_id,
-                confirmed_round=getattr(result, "confirmed_round", 0),
-            )
-        except Exception as exc:
-            logger.warning("x402-avm verification failed, falling back to algod: %s", exc)
-            return None
-
-    return await asyncio.to_thread(_verify)
+    return PaymentRequirements(
+        scheme=settings.X402_SCHEME,
+        network=settings.X402_NETWORK_CAIP2,
+        asset=str(expected_asa_id or settings.USDC_TESTNET_ASA_ID),
+        amount=str(expected_amount),
+        pay_to=expected_recipient,
+        max_timeout_seconds=settings.X402_MAX_TIMEOUT_SECONDS,
+    )
 
 
-async def verify_payment(
+async def verify_and_settle_via_facilitator(
     *,
-    tx_id: str,
+    payment_payload_dict: dict,
     expected_recipient: str,
     expected_amount: int,
     expected_asa_id: int | None,
 ) -> VerifiedPayment:
-    """Primary entrypoint used by the middleware: try the x402-avm SDK
-    first for speed/protocol conformance, and always fall back to a
-    direct algod/indexer check so verification never hard-depends on a
-    third-party package being installed or working.
-    """
-    fast_result = await verify_payment_with_x402_avm(
-        tx_id=tx_id,
-        expected_recipient=expected_recipient,
-        expected_amount=expected_amount,
-        expected_asa_id=expected_asa_id,
-    )
-    if fast_result is not None:
-        return fast_result
+    """Primary x402 v2 entrypoint. Sends the agent's signed PaymentPayload
+    to GoPlausible's hosted facilitator for /verify then /settle, and
+    returns the resulting on-chain settlement as a VerifiedPayment.
 
-    return await verify_payment_on_chain(
-        tx_id=tx_id,
+    Raises PaymentVerificationError on any facilitator-reported failure,
+    or if the facilitator itself is unreachable/errors -- this deliberately
+    does NOT fall back to direct algod verification, because a payment
+    that GoPlausible hasn't settled was never actually paid into escrow.
+    """
+    requirements = build_payment_requirements(
         expected_recipient=expected_recipient,
         expected_amount=expected_amount,
         expected_asa_id=expected_asa_id,
     )
+
+    try:
+        payload = PaymentPayload.model_validate(
+            {**payment_payload_dict, "accepted": requirements.model_dump(by_alias=True)}
+        )
+    except Exception as exc:
+        raise PaymentVerificationError(f"Malformed PaymentPayload: {exc}") from exc
+
+    facilitator = get_facilitator_client()
+
+    logger.info("facilitator verification started network=%s asset=%s", requirements.network, requirements.asset)
+    try:
+        verify_result = await facilitator.verify(payload, requirements)
+    except Exception as exc:
+        raise PaymentVerificationError(f"GoPlausible facilitator unreachable or errored on /verify: {exc}") from exc
+
+    if not verify_result.is_valid:
+        raise PaymentVerificationError(
+            f"Facilitator rejected payment: {verify_result.invalid_reason or verify_result.invalid_message}"
+        )
+    logger.info("facilitator verification succeeded payer=%s", verify_result.payer)
+
+    logger.info("facilitator settlement started")
+    try:
+        settle_result = await facilitator.settle(payload, requirements)
+    except Exception as exc:
+        raise PaymentVerificationError(f"GoPlausible facilitator unreachable or errored on /settle: {exc}") from exc
+
+    if not settle_result.success:
+        raise PaymentVerificationError(
+            f"Facilitator settlement failed: {settle_result.error_reason or settle_result.error_message}"
+        )
+    logger.info("facilitator settlement succeeded tx=%s", settle_result.transaction)
+
+    return VerifiedPayment(
+        tx_id=settle_result.transaction,
+        payer_address=settle_result.payer or verify_result.payer or "",
+        receiver_address=expected_recipient,
+        amount=expected_amount,
+        asa_id=expected_asa_id,
+        confirmed_round=0,  # GoPlausible's SettleResponse doesn't return a round; the
+                            # settlement tx id itself is what you look up on Lora.
+    )
+
+
+async def verify_payment(
+    *,
+    payment_payload_dict: dict | None = None,
+    tx_id: str | None = None,
+    expected_recipient: str,
+    expected_amount: int,
+    expected_asa_id: int | None,
+) -> VerifiedPayment:
+    """Primary entrypoint used by purchase_service.
+
+    If a PaymentPayload dict is supplied, verification/settlement goes
+    through the GoPlausible facilitator (the required path). The legacy
+    tx_id path is kept only for the existing direct algod/indexer
+    fallback -- useful for tests/local dev without a live facilitator --
+    but is no longer what production purchases use.
+    """
+    if payment_payload_dict is not None:
+        return await verify_and_settle_via_facilitator(
+            payment_payload_dict=payment_payload_dict,
+            expected_recipient=expected_recipient,
+            expected_amount=expected_amount,
+            expected_asa_id=expected_asa_id,
+        )
+
+    if tx_id is not None:
+        return await verify_payment_on_chain(
+            tx_id=tx_id,
+            expected_recipient=expected_recipient,
+            expected_amount=expected_amount,
+            expected_asa_id=expected_asa_id,
+        )
+
+    raise PaymentVerificationError("verify_payment requires either payment_payload_dict or tx_id")
