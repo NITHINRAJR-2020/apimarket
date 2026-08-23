@@ -37,6 +37,16 @@ class Settings(BaseSettings):
     INDEXER_TOKEN: str = ""
     ALGORAND_NETWORK: str = "testnet"
     USDC_TESTNET_ASA_ID: int = 10458941
+    # app/core/config.py — add right after ALGORAND_NETWORK / USDC_TESTNET_ASA_ID (line ~39)
+
+    # --- x402 v2 / GoPlausible facilitator ---
+    FACILITATOR_URL: str = "https://facilitator.goplausible.xyz"
+    # CAIP-2 identifier required by x402 v2 — NOT the plain string "testnet".
+    # This is the same value as x402.mechanisms.avm.ALGORAND_TESTNET_CAIP2;
+    # kept as a plain setting (not imported from the SDK) so config.py has
+    # no hard dependency on x402-avm being importable at settings-load time.
+    X402_NETWORK_CAIP2: str = "algorand:SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI="
+    X402_MAX_TIMEOUT_SECONDS: int = 60
 
     # --- x402 protocol ---
     X402_SCHEME: str = "exact"
