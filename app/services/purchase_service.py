@@ -136,31 +136,41 @@ async def _evaluate_policy(db: AsyncSession, agent: Agent, listing: Listing) -> 
 
 
 def build_402_body(listing: Listing) -> tuple[dict, dict]:
+    """x402 v2 402 response. The internal signed quote_token still binds
+    path/price/escrow-recipient/asset/expiry (replay + tamper protection
+    for OUR marketplace semantics) and now travels inside `extra`, since
+    x402 v2's PaymentRequirements has no room for marketplace-specific
+    claims. The facilitator itself only ever sees scheme/network/asset/
+    amount/payTo -- it doesn't need or see the quote token.
+    """
     quote_token, expires_at = x402_quote.create_quote(
         listing_path=listing.path,
         price_microalgos=listing.price_microalgos,
         asa_id=listing.asa_id,
     )
-    asset_label = f"asa:{listing.asa_id}" if listing.asa_id else "algo:native"
-    body = {
-        "x402Version": 1,
+    asset_id = str(listing.asa_id or settings.USDC_TESTNET_ASA_ID)
+    requirement = {
         "scheme": settings.X402_SCHEME,
-        "network": settings.ALGORAND_NETWORK,
-        "resource": f"/market/{listing.path}/call",
-        "description": f"Escrowed payment required to call '{listing.name}'",
+        "network": settings.X402_NETWORK_CAIP2,
+        "asset": asset_id,
+        "amount": str(listing.price_microalgos),
         "payTo": settings.ESCROW_WALLET_ADDRESS,
-        "maxAmountRequired": str(listing.price_microalgos),
-        "asset": asset_label,
-        "quote": quote_token,
-        "expiresAt": str(expires_at),
-        "note": "payTo is the marketplace's escrow wallet, not the provider. "
-                "Funds are held until the API call is proxied and confirmed successful.",
+        "maxTimeoutSeconds": settings.X402_MAX_TIMEOUT_SECONDS,
+        "extra": {"name": "USDC", "decimals": 6, "quote": quote_token, "quoteExpiresAt": expires_at},
+    }
+    body = {
+        "x402Version": 2,
+        "resource": {
+            "url": f"/market/{listing.path}/call",
+            "description": f"Escrowed payment required to call '{listing.name}'",
+        },
+        "accepts": [requirement],
     }
     headers = {
         "X-402-Price": str(listing.price_microalgos),
         "X-402-Recipient": settings.ESCROW_WALLET_ADDRESS,
-        "X-402-Network": settings.ALGORAND_NETWORK,
-        "X-402-Asset": asset_label,
+        "X-402-Network": settings.X402_NETWORK_CAIP2,
+        "X-402-Asset": asset_id,
         "X-402-Quote": quote_token,
     }
     return body, headers
@@ -211,10 +221,10 @@ async def start_or_settle_purchase(
         body, headers = build_402_body(listing)
         return agent, listing, None, body, headers
 
-    tx_id = payment_proof.get("tx_id")
+       payment_payload = payment_proof.get("payment_payload")
     quote_token = payment_proof.get("quote")
-    if not tx_id or not quote_token:
-        raise PurchaseError(400, "Payment proof must include 'tx_id' and 'quote'")
+    if not payment_payload or not quote_token:
+        raise PurchaseError(400, "Payment proof must include 'payment_payload' and 'quote'")
 
     try:
         x402_quote.verify_quote(
@@ -226,9 +236,21 @@ async def start_or_settle_purchase(
     except x402_quote.QuoteError as exc:
         raise PurchaseError(402, f"Invalid quote: {exc}") from exc
 
-    replay = await db.execute(select(Transaction).where(Transaction.deposit_tx_id == tx_id))
+    try:
+        verified = await verify_payment(
+            payment_payload_dict=payment_payload,
+            expected_recipient=settings.ESCROW_WALLET_ADDRESS,
+            expected_amount=listing.price_microalgos,
+            expected_asa_id=listing.asa_id,
+        )
+    except PaymentVerificationError as exc:
+        raise PurchaseError(402, f"Escrow payment verification failed: {exc}") from exc
+
+    # Replay protection: check AFTER settlement so we're checking the real
+    # settlement tx id GoPlausible returned, not a client-supplied value.
+    replay = await db.execute(select(Transaction).where(Transaction.deposit_tx_id == verified.tx_id))
     if replay.scalar_one_or_none() is not None:
-        raise PurchaseError(409, f"Transaction {tx_id} has already been used for a purchase (replay)")
+        raise PurchaseError(409, f"Transaction {verified.tx_id} has already been used for a purchase (replay)")
 
     try:
         verified = await verify_payment(
